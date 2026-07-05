@@ -13,7 +13,7 @@ const { createWorker } = require("tesseract.js");
 const { TOKEN, TRAP_CHANNEL_ID } = process.env;
 
 if (!TOKEN || !TRAP_CHANNEL_ID) {
-  console.error("Fehlende Umgebungsvariablen: TOKEN und TRAP_CHANNEL_ID müssen in .env gesetzt sein.");
+  console.error("Missing environment variables: TOKEN and TRAP_CHANNEL_ID must be set in .env.");
   process.exit(1);
 }
 
@@ -32,7 +32,7 @@ function saveState(state) {
   try {
     fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
   } catch (err) {
-    console.error("[STATE] Konnte Zustand nicht speichern:", err.message);
+    console.error("[STATE] Could not save state:", err.message);
   }
 }
 
@@ -64,8 +64,8 @@ function buildTrapMessage(count, date = new Date()) {
   ].join("\n");
 }
 
-// --- Scam-Filter: läuft in JEDEM Channel, nicht nur im Trap-Channel ---
-// Deckt genau das Muster aus dem Screenshot ab (Fake-Giveaway/Crypto-Casino).
+// --- Scam filter: runs in every channel, not only in the trap channel ---
+// Covers common fake giveaway and crypto casino spam patterns.
 
 const SCAM_PATTERNS = [
   /claim\s+(your\s+)?(reward|bonus|prize)/i,
@@ -79,10 +79,10 @@ const SCAM_PATTERNS = [
   /invite.{0,10}friends.{0,20}(bonus|reward|crypto)/i
 ];
 
-const NEW_ACCOUNT_MS = 3 * 24 * 60 * 60 * 1000; // Account < 3 Tage alt + Link = verdächtig
+const NEW_ACCOUNT_MS = 3 * 24 * 60 * 60 * 1000; // Account younger than 3 days + link = suspicious
 const CROSS_POST_WINDOW_MS = 20 * 1000;
-const CROSS_POST_MIN_CHANNELS = 3; // gleiche Nachricht in 3+ Channels = Spam-Blast
-const CROSS_POST_MIN_LENGTH = 20; // kurze Nachrichten ("lol" etc.) ignorieren
+const CROSS_POST_MIN_CHANNELS = 3; // Same message in 3+ channels = spam blast
+const CROSS_POST_MIN_LENGTH = 20; // Ignore short messages such as "lol"
 
 function looksLikeScam(message) {
   const content = message.content;
@@ -122,19 +122,18 @@ setInterval(() => {
   }
 }, 30 * 1000);
 
-// --- Bild-OCR: AutoMod und der Text-Filter oben sehen NUR message.content, keine Bilder. ---
-// Scam-Text, der nur im Screenshot steckt (kein Fließtext in der Nachricht), rutscht sonst durch.
-// Worker wird einmal beim Start erzeugt (initOcrWorker) und wiederverwendet - pro Bild neu zu
-// initialisieren wäre spürbar langsamer.
+// --- Image OCR: AutoMod and the text filter above only see message.content, not images. ---
+// Scam text embedded in screenshots can otherwise slip through.
+// The worker is created once at startup and reused because starting it per image is much slower.
 
 let ocrWorker = null;
 
 async function initOcrWorker() {
   try {
     ocrWorker = await createWorker("eng");
-    console.log("[OCR] Worker bereit.");
+    console.log("[OCR] Worker ready.");
   } catch (err) {
-    console.error("[OCR] Konnte Worker nicht starten, Bild-Scan deaktiviert:", err.message);
+    console.error("[OCR] Could not start worker, image scanning disabled:", err.message);
   }
 }
 
@@ -154,15 +153,15 @@ async function imageContainsScamText(urls) {
       const { data } = await ocrWorker.recognize(url);
       if (SCAM_PATTERNS.some((re) => re.test(data.text))) return true;
     } catch (err) {
-      console.error("[OCR] Fehler bei", url, ":", err.message);
+      console.error("[OCR] Error while scanning", url, ":", err.message);
     }
   }
   return false;
 }
 
-// --- Native Discord-AutoMod-Regel ---
-// Blockt + timeoutet serverseitig, BEVOR die Nachricht überhaupt in einem Channel
-// landet. Kann von Spam-Scripts nicht durch Channel-Erkennung umgangen werden.
+// --- Native Discord AutoMod rule ---
+// Blocks and timeouts server-side before the message appears in a channel.
+// Spam scripts cannot bypass it by detecting the trap channel.
 
 async function ensureAutoMod(guild) {
   try {
@@ -188,9 +187,9 @@ async function ensureAutoMod(guild) {
       ],
       enabled: true
     });
-    console.log("[AUTOMOD] Anti-Scam-Regel erstellt.");
+    console.log("[AUTOMOD] Anti-Scam rule created.");
   } catch (err) {
-    console.error("[AUTOMOD] Konnte Regel nicht erstellen (Bot braucht 'Manage Server'):", err.message);
+    console.error("[AUTOMOD] Could not create rule (bot needs 'Manage Server'):", err.message);
   }
 }
 
@@ -206,12 +205,12 @@ const client = new Client({
 let trapChannel = null;
 let trapMessage = null;
 
-// Stellt sicher, dass die Warnnachricht im Trap-Kanal existiert.
-// Aktualisiert eine vorhandene Nachricht oder erstellt sie neu.
+// Ensures that the warning message exists in the trap channel.
+// Updates the existing message or creates a new one.
 async function ensureTrapMessage() {
   trapChannel = await client.channels.fetch(TRAP_CHANNEL_ID);
   if (!trapChannel || !trapChannel.isTextBased()) {
-    throw new Error("TRAP_CHANNEL_ID verweist nicht auf einen Textkanal.");
+    throw new Error("TRAP_CHANNEL_ID does not point to a text channel.");
   }
 
   const content = buildTrapMessage(state.count);
@@ -220,20 +219,20 @@ async function ensureTrapMessage() {
     try {
       trapMessage = await trapChannel.messages.fetch(state.messageId);
       await trapMessage.edit(content);
-      console.log("[TRAP] Bestehende Warnnachricht aktualisiert.");
+      console.log("[TRAP] Existing warning message updated.");
       return;
     } catch {
-      console.warn("[TRAP] Gespeicherte Nachricht nicht gefunden, erstelle eine neue.");
+      console.warn("[TRAP] Saved message not found, creating a new one.");
     }
   }
 
   trapMessage = await trapChannel.send(content);
   state.messageId = trapMessage.id;
   saveState(state);
-  console.log("[TRAP] Warnnachricht im Kanal gepostet.");
+  console.log("[TRAP] Warning message posted in channel.");
 }
 
-// Bearbeitet die bestehende Warnnachricht mit dem aktuellen Zählerstand.
+// Edits the existing warning message with the current counter.
 async function updateTrapMessage() {
   try {
     if (!trapMessage) {
@@ -241,9 +240,9 @@ async function updateTrapMessage() {
       return;
     }
     await trapMessage.edit(buildTrapMessage(state.count));
-    console.log(`[TRAP] Warnnachricht aktualisiert (${state.count} Timeouts).`);
+    console.log(`[TRAP] Warning message updated (${state.count} timeouts).`);
   } catch (err) {
-    console.error("[TRAP] Aktualisierung fehlgeschlagen, erstelle neu:", err.message);
+    console.error("[TRAP] Update failed, recreating message:", err.message);
     state.messageId = null;
     await ensureTrapMessage();
   }
@@ -255,18 +254,18 @@ client.on("ready", async () => {
     await ensureTrapMessage();
     await ensureAutoMod(trapChannel.guild);
   } catch (err) {
-    console.error("[TRAP] Konnte Warnnachricht nicht einrichten:", err.message);
+    console.error("[TRAP] Could not set up warning message:", err.message);
   }
   await initOcrWorker();
 });
 
-// Löscht die Nachricht, timeoutet den Autor und räumt dessen Nachrichten
-// der letzten 24h serverweit auf. Wird von Trap-Channel UND Scam-Filter genutzt.
+// Deletes the message, timeouts the author, and removes their messages from the last 24 hours.
+// Used by both the trap channel and the scam filter.
 async function punishAndCleanup(message, reason) {
   try {
     await message.delete().catch(() => {});
     await message.member.timeout(7 * 24 * 60 * 60 * 1000, reason);
-    console.log(`[PUNISH] ${message.author.tag} (${message.author.id}) getimeoutet: ${reason}`);
+    console.log(`[PUNISH] ${message.author.tag} (${message.author.id}) timed out: ${reason}`);
 
     state.count += 1;
     saveState(state);
@@ -284,10 +283,10 @@ async function punishAndCleanup(message, reason) {
           );
           if (toDelete.size > 0) {
             await channel.bulkDelete(toDelete, true);
-            console.log(`[CLEANUP] ${toDelete.size} Nachricht(en) in #${channel.name} gelöscht.`);
+            console.log(`[CLEANUP] Deleted ${toDelete.size} message(s) in #${channel.name}.`);
           }
         } catch (err) {
-          console.error(`[CLEANUP] Fehler in #${channel.name}:`, err.message);
+          console.error(`[CLEANUP] Error in #${channel.name}:`, err.message);
         }
       })
     );
@@ -317,10 +316,10 @@ client.on("messageCreate", async (message) => {
     if (imageUrls.length > 0) {
       const hasLink = /https?:\/\//i.test(message.content);
       const isNewAccount = Date.now() - message.author.createdTimestamp < NEW_ACCOUNT_MS;
-      // OCR nur bei Link ODER neuem Account auslösen - spart CPU und vermeidet False
-      // Positives bei normalen Screenshots (z.B. Trading-Charts) von etablierten Membern.
+      // Only run OCR for links or new accounts to save CPU and reduce false positives
+      // on normal screenshots from established members.
       if ((hasLink || isNewAccount) && (await imageContainsScamText(imageUrls))) {
-        return punishAndCleanup(message, "Auto-Scam-Filter (Bild-OCR)");
+        return punishAndCleanup(message, "Auto-Scam-Filter (Image OCR)");
       }
     }
   }
