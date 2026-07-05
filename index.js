@@ -316,9 +316,10 @@ client.on("messageCreate", async (message) => {
     if (imageUrls.length > 0) {
       const hasLink = /https?:\/\//i.test(message.content);
       const isNewAccount = Date.now() - message.author.createdTimestamp < NEW_ACCOUNT_MS;
-      // Only run OCR for links or new accounts to save CPU and reduce false positives
-      // on normal screenshots from established members.
-      if ((hasLink || isNewAccount) && (await imageContainsScamText(imageUrls))) {
+      const noCaption = message.content.trim().length === 0;
+      // Bug: image-only posts with no caption had neither a link nor necessarily a new
+      // account, so the gate never triggered OCR. noCaption closes that gap.
+      if ((hasLink || isNewAccount || noCaption) && (await imageContainsScamText(imageUrls))) {
         return punishAndCleanup(message, "Auto-Scam-Filter (Image OCR)");
       }
     }
