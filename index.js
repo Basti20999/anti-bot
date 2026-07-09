@@ -6,7 +6,8 @@ const {
   GatewayIntentBits,
   AutoModerationRuleTriggerType,
   AutoModerationRuleEventType,
-  AutoModerationActionType
+  AutoModerationActionType,
+  PermissionsBitField
 } = require("discord.js");
 const { createWorker } = require("tesseract.js");
 
@@ -67,30 +68,51 @@ function buildTrapMessage(count, date = new Date()) {
 // --- Scam filter: runs in every channel, not only in the trap channel ---
 // Covers common fake giveaway and crypto casino spam patterns.
 
-const SCAM_PATTERNS = [
-  /claim\s+(your\s+)?(reward|bonus|prize)/i,
-  /(activate|redeem)\s+(the\s+|your\s+)?code/i,
+// STRONG: essentially never appear outside an actual scam, punish on their own.
+const SCAM_PATTERNS_STRONG = [
   /rakeback/i,
   /(crypto|betting|bet)\s*casino/i,
   /withdrawal\s+(was\s+)?success/i,
-  /giving\s+away/i,
   /free\s+(nitro|crypto|btc|eth|usdt)/i,
   /\$\d{2,}\s*(giveaway|bonus|reward)/i,
-  /invite.{0,10}friends.{0,20}(bonus|reward|crypto)/i
+  /invite.{0,10}friends.{0,20}(bonus|reward|crypto)/i,
+  // "giving away" tied to sale/price language in the same message — the compound
+  // condition is already specific enough to stand on its own (unlike bare "giving away").
+  /giving\s+away[^.!?\n]{0,60}(free|cheap|discount|for\s+sale|selling|\$\d)/i
 ];
 
-const NEW_ACCOUNT_MS = 3 * 24 * 60 * 60 * 1000; // Account younger than 3 days + link = suspicious
+// WEAK: common phrasing that also shows up in normal chat on its own. A single WEAK
+// hit needs a second signal (another hit, a link, or a brand-new account) to punish.
+// This is what was nuking normal messages: bare "giving away" used to be in this
+// list and matched things like "without giving away spoilers".
+const SCAM_PATTERNS_WEAK = [
+  /claim\s+(your\s+)?(reward|bonus|prize)/i,
+  /(activate|redeem)\s+(the\s+|your\s+)?code/i
+];
+
+const SCAM_SCORE_THRESHOLD = 2;
+const NEW_ACCOUNT_MS = 3 * 24 * 60 * 60 * 1000; // Account younger than 3 days = extra weight
 const CROSS_POST_WINDOW_MS = 20 * 1000;
 const CROSS_POST_MIN_CHANNELS = 3; // Same message in 3+ channels = spam blast
 const CROSS_POST_MIN_LENGTH = 20; // Ignore short messages such as "lol"
 
+function textScamScore(text) {
+  let score = 0;
+  if (SCAM_PATTERNS_STRONG.some((re) => re.test(text))) score += 2;
+  score += SCAM_PATTERNS_WEAK.filter((re) => re.test(text)).length;
+  return score;
+}
+
 function looksLikeScam(message) {
   const content = message.content;
-  if (SCAM_PATTERNS.some((re) => re.test(content))) return true;
-
   const hasLink = /https?:\/\//i.test(content);
-  const accountAge = Date.now() - message.author.createdTimestamp;
-  return hasLink && accountAge < NEW_ACCOUNT_MS;
+  const isNewAccount = Date.now() - message.author.createdTimestamp < NEW_ACCOUNT_MS;
+
+  let score = textScamScore(content);
+  if (hasLink) score += 1;
+  if (isNewAccount) score += 1;
+
+  return score >= SCAM_SCORE_THRESHOLD;
 }
 
 // authorId -> { hash, channels: Set<channelId>, timestamp }
@@ -147,11 +169,11 @@ function getImageUrls(message) {
   return [...new Set([...attachmentUrls, ...embedUrls])];
 }
 
-async function imageContainsScamText(urls) {
+async function imageContainsScamText(urls, bonus = 0) {
   for (const url of urls) {
     try {
       const { data } = await ocrWorker.recognize(url);
-      if (SCAM_PATTERNS.some((re) => re.test(data.text))) return true;
+      if (textScamScore(data.text) + bonus >= SCAM_SCORE_THRESHOLD) return true;
     } catch (err) {
       console.error("[OCR] Error while scanning", url, ":", err.message);
     }
@@ -201,6 +223,21 @@ const client = new Client({
     GatewayIntentBits.GuildMembers
   ]
 });
+
+// Anyone who can already moderate the server is exempt from the passive filters
+// (scam-keyword, cross-post, OCR) — staff routinely trigger them just doing normal
+// server-management things (posting one announcement in 3 channels, saying "claim
+// your prize" for a real event, etc). The trap channel still applies to everyone.
+const TRUSTED_PERMISSIONS = [
+  PermissionsBitField.Flags.Administrator,
+  PermissionsBitField.Flags.ManageGuild,
+  PermissionsBitField.Flags.ManageMessages,
+  PermissionsBitField.Flags.ModerateMembers
+];
+
+function isTrusted(member) {
+  return TRUSTED_PERMISSIONS.some((perm) => member.permissions.has(perm));
+}
 
 let trapChannel = null;
 let trapMessage = null;
@@ -303,6 +340,8 @@ client.on("messageCreate", async (message) => {
     return punishAndCleanup(message, "Security Trap Channel");
   }
 
+  if (isTrusted(message.member)) return;
+
   if (looksLikeScam(message)) {
     return punishAndCleanup(message, "Auto-Scam-Filter (Keyword)");
   }
@@ -317,10 +356,15 @@ client.on("messageCreate", async (message) => {
       const hasLink = /https?:\/\//i.test(message.content);
       const isNewAccount = Date.now() - message.author.createdTimestamp < NEW_ACCOUNT_MS;
       const noCaption = message.content.trim().length === 0;
-      // Bug: image-only posts with no caption had neither a link nor necessarily a new
-      // account, so the gate never triggered OCR. noCaption closes that gap.
-      if ((hasLink || isNewAccount || noCaption) && (await imageContainsScamText(imageUrls))) {
-        return punishAndCleanup(message, "Auto-Scam-Filter (Image OCR)");
+      // Still scan every captionless image (closes the original evasion gap where a
+      // veteran account could post a scam screenshot with no text at all), but a
+      // single generic WEAK phrase caught by noisy OCR text no longer punishes by
+      // itself — same score threshold as real text messages.
+      if (hasLink || isNewAccount || noCaption) {
+        const bonus = (hasLink ? 1 : 0) + (isNewAccount ? 1 : 0);
+        if (await imageContainsScamText(imageUrls, bonus)) {
+          return punishAndCleanup(message, "Auto-Scam-Filter (Image OCR)");
+        }
       }
     }
   }
